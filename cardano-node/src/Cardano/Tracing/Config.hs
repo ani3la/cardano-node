@@ -37,6 +37,7 @@ type TraceBlockFetchProtocolSerialised = ("TraceBlockFetchProtocolSerialised" ::
 type TraceBlockFetchServer = ("TraceBlockFetchServer" :: Symbol)
 type TraceChainDB = ("TraceChainDB" :: Symbol)
 type TraceChainSyncClient = ("TraceChainSyncClient" :: Symbol)
+type TraceChainSyncReqRsp = ("TraceChainSyncReqRsp" :: Symbol)
 type TraceChainSyncBlockServer = ("TraceChainSyncBlockServer" :: Symbol)
 type TraceChainSyncHeaderServer = ("TraceChainSyncHeaderServer" :: Symbol)
 type TraceChainSyncProtocol = ("TraceChainSyncProtocol" :: Symbol)
@@ -86,6 +87,7 @@ data TraceSelection
   , traceChainDB :: OnOff TraceChainDB
   , traceChainSyncBlockServer :: OnOff TraceChainSyncBlockServer
   , traceChainSyncClient :: OnOff TraceChainSyncClient
+  , traceChainSyncReqRsp :: OnOff TraceChainSyncReqRsp
   , traceChainSyncHeaderServer :: OnOff TraceChainSyncHeaderServer
   , traceChainSyncProtocol :: OnOff TraceChainSyncProtocol
   , traceDiffusionInitialization :: OnOff TraceDiffusionInitialization
@@ -134,6 +136,8 @@ traceConfigParser v =
       chainSyncBlockServer = OnOff False
       chainSyncClient :: OnOff TraceChainSyncClient
       chainSyncClient = OnOff True
+      chainSyncReqRsp :: OnOff TraceChainSyncReqRsp
+      chainSyncReqRsp = OnOff True
       chainSyncHeaderServer :: OnOff TraceChainSyncHeaderServer
       chainSyncHeaderServer = OnOff False
       chainSyncProtocol :: OnOff TraceChainSyncProtocol
@@ -194,6 +198,7 @@ traceConfigParser v =
     <*> v .:? getName chainDB .!=  chainDB
     <*> v .:? getName chainSyncBlockServer .!= chainSyncBlockServer
     <*> v .:? getName chainSyncClient .!= chainSyncClient
+    <*> v .:? getName chainSyncReqRsp .!= chainSyncReqRsp
     <*> v .:? getName chainSyncHeaderServer .!= chainSyncHeaderServer
     <*> v .:? getName chainSyncProtocol .!= chainSyncProtocol
     <*> v .:? getName diffusionInitialization .!= diffusionInitialization

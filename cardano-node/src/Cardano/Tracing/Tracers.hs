@@ -23,16 +23,17 @@ module Cardano.Tracing.Tracers
   , traceCounter
   ) where
 
-import           Cardano.Prelude hiding (show)
+import           Cardano.Prelude hiding (show, atomically)
 import           Prelude (String, show)
 
 import           GHC.Clock (getMonotonicTimeNSec)
 
 import           Codec.CBOR.Read (DeserialiseFailure)
+import           Control.Monad.Class.MonadSTM.Strict
+import           Control.Monad.Class.MonadTime
 import           Data.Aeson (ToJSON (..), Value (..))
 import qualified Data.HashMap.Strict as Map
 import qualified Data.Text as Text
-import           Data.Time (UTCTime)
 
 import           Network.Mux (MuxTrace, WithMuxBearer)
 import qualified Network.Socket as Socket (SockAddr)
@@ -72,11 +73,14 @@ import           Ouroboros.Network.Block (BlockNo (..), HasHeader (..), Point, S
                      blockNo, pointSlot, unBlockNo)
 import           Ouroboros.Network.BlockFetch.ClientState (TraceLabelPeer (..))
 import           Ouroboros.Network.BlockFetch.Decision (FetchDecision, FetchDecline (..))
+import           Ouroboros.Network.DeltaQ
 import qualified Ouroboros.Network.NodeToClient as NtC
 import qualified Ouroboros.Network.NodeToNode as NtN
 import           Ouroboros.Network.Point (fromWithOrigin, withOrigin)
 import           Ouroboros.Network.Protocol.LocalStateQuery.Type (ShowQuery)
+import           Ouroboros.Network.Protocol.ChainSync.ClientPipelined (TraceChainsyncClientObservation (..))
 import           Ouroboros.Network.Subscription
+import           Ouroboros.Network.Util.TaggedObserve
 
 import qualified Ouroboros.Consensus.Storage.ChainDB as ChainDB
 import qualified Ouroboros.Consensus.Storage.LedgerDB.OnDisk as LedgerDB
@@ -95,6 +99,8 @@ import           Cardano.Node.Protocol.Byron ()
 import           Cardano.Node.Protocol.Shelley ()
 
 import qualified Ouroboros.Network.Diffusion as ND
+
+import Text.Printf
 
 {- HLINT ignore "Redundant bracket" -}
 {- HLINT ignore "Use record patterns" -}
@@ -302,6 +308,7 @@ mkTracers TracingOff _ _ =
     { chainDBTracer = nullTracer
     , consensusTracers = Consensus.Tracers
       { Consensus.chainSyncClientTracer = nullTracer
+      , Consensus.chainSyncReqRspTracer = nullTracer
       , Consensus.chainSyncServerHeaderTracer = nullTracer
       , Consensus.chainSyncServerBlockTracer = nullTracer
       , Consensus.blockFetchDecisionTracer = nullTracer
@@ -444,9 +451,11 @@ mkConsensusTracers trSel verb tr nodeKern fStats = do
   blockForgeOutcomeExtractor <- mkOutcomeExtractor
   elidedFetchDecision <- newstate  -- for eliding messages in FetchDecision tr
   forgeTracers <- mkForgeTracers
+  csReqRspTracer <- chainSyncReqRspTracer trSel tr
 
   pure Consensus.Tracers
     { Consensus.chainSyncClientTracer = tracerOnOff (traceChainSyncClient trSel) verb "ChainSyncClient" tr
+    , Consensus.chainSyncReqRspTracer = csReqRspTracer
     , Consensus.chainSyncServerHeaderTracer = tracerOnOff (traceChainSyncHeaderServer trSel) verb "ChainSyncHeaderServer" tr
     , Consensus.chainSyncServerBlockTracer = tracerOnOff (traceChainSyncBlockServer trSel) verb "ChainSyncBlockServer" tr
     , Consensus.blockFetchDecisionTracer = tracerOnOff' (traceBlockFetchDecisions trSel) $
@@ -817,6 +826,90 @@ forgeStateInfoTracer p _ts tracer = Tracer $ \ev -> do
   where
     fsTracer :: Trace IO Text -> Tracer IO (Consensus.TraceLabelCreds (ForgeStateInfo blk))
     fsTracer tr = showTracing $ contramap Text.pack $ toLogObject tr
+
+-- XXX Move?
+data ObservableTag = IntersectTag
+                   | NextTag
+                   deriving Show
+
+chainSyncReqRspTracer
+  :: TraceSelection
+  -> Trace IO Text
+  -> IO (Tracer IO TraceChainsyncClientObservation)
+chainSyncReqRspTracer _ts tracer = do
+  intersectState <- newTMVarIO Nothing
+  nextState <- newTMVarIO Nothing
+
+  intersectGSV <- newTVarIO defaultGSV
+  nextGSV <- newTVarIO defaultGSV
+
+  return $ transform $ matchTaggedObservations
+    (\case
+      IntersectTag -> atomically $ swapTMVar intersectState Nothing
+      NextTag      -> atomically $ swapTMVar nextState Nothing
+    )
+    (\case
+      IntersectTag -> void . atomically . swapTMVar intersectState . Just
+      NextTag      -> void . atomically . swapTMVar nextState . Just
+    )
+    (flip diffTime)
+    (Tracer $ csTracer intersectGSV nextGSV)
+
+  where
+    transform :: Tracer IO (TaggedObservable ObservableTag Time Time DiffTime)
+              -> Tracer IO TraceChainsyncClientObservation
+    transform tr = Tracer $ \observeIndicator -> do
+      now <- getMonotonicTime
+      case observeIndicator of
+        IntersectObservation ObserveBefore ->
+            traceWith tr $ TOStart IntersectTag now
+        IntersectObservation ObserveAfter  ->
+            traceWith tr $ TOEnd   IntersectTag now Nothing
+        NextObservation      ObserveBefore ->
+            traceWith tr $ TOStart NextTag now
+        NextObservation      ObserveAfter  ->
+            traceWith tr $ TOEnd   NextTag now Nothing
+
+    csTracer :: StrictTVar IO PeerGSV
+             -> StrictTVar IO PeerGSV
+             -> TaggedObservable ObservableTag Time Time DiffTime -> IO ()
+    csTracer _ _ (TOStart NextTag _) = printf "TOStart NextTag\n"
+    csTracer _ _ (TOStart IntersectTag _) = printf "TOStart IntersectTag\n"
+    csTracer _ _ (TOEnd _ _ Nothing) = printf "TOEnd no sample\n"
+    csTracer intersectGSV _ (TOEnd IntersectTag endTime (Just delta)) =
+        traceMetric "chainSyncIntersect" intersectGSV endTime delta
+    csTracer _ nextGSV (TOEnd NextTag endTime (Just delta)) =
+        traceMetric "chainSyncNext" nextGSV endTime delta
+
+    gGSV :: GSV -> DiffTime
+    gGSV (GSV g _ _) = g
+
+    traceMetric
+      :: Text
+      -> StrictTVar IO PeerGSV
+      -> Time
+      -> DiffTime
+      -> IO ()
+    traceMetric name gsvVar endTime@(Time e) delta = do
+        let startTime = Time (e - delta)
+            newGSV = fromSample startTime endTime 128
+            metricsTr = appendName "metrics" tracer
+
+        value <- atomically $ do
+            gsv <- readTVar gsvVar
+            let gsv' = newGSV <> gsv
+            writeTVar gsvVar gsv'
+            return $ (realToFrac $ gGSV (outboundGSV gsv') :: Double) +
+                (realToFrac $ gGSV (inboundGSV gsv') :: Double)
+
+        let logValue :: LOContent Text
+            logValue = LogValue name $ PureI
+                $ round $ 1000 * value
+        printf "collecting intersect sample %s value %s\n" (show delta) (show $ value)
+        meta <- mkLOMeta Critical Confidential
+        traceNamedObject metricsTr (meta, logValue)
+
+
 
 --------------------------------------------------------------------------------
 -- NodeToClient Tracers
